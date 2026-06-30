@@ -126,6 +126,9 @@ class SidecarClient extends import_node_events.EventEmitter {
   zoneAction(params) {
     return this.request("zone_action", params);
   }
+  planAction(params) {
+    return this.request("plan_action", params);
+  }
   startAreas(params) {
     return this.request("start_areas", params);
   }

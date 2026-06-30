@@ -23,6 +23,15 @@ export interface NormalizedDeviceZone {
     active: boolean;
 }
 
+export interface NormalizedDevicePlan {
+    id: string;
+    name: string;
+    info: Record<string, Primitive>;
+    schedule: Record<string, Primitive>;
+    configuration: Record<string, Primitive>;
+    zones: Record<string, Primitive>;
+}
+
 export interface NormalizedDeviceSnapshot {
     id: string;
     name: string;
@@ -47,6 +56,7 @@ export interface NormalizedDeviceSnapshot {
     configuration: Record<string, Primitive>;
     configurationLimits: Record<string, Primitive>;
     zones: NormalizedDeviceZone[];
+    plans: NormalizedDevicePlan[];
 }
 
 export interface JsonRpcRequest<TParams = unknown> {
@@ -149,6 +159,12 @@ export interface SidecarSetSettingParams {
 export interface SidecarZoneActionParams {
     device_id: string;
     action: "syncMap" | "syncAreaNames" | "syncPlans";
+}
+
+export interface SidecarPlanActionParams {
+    device_id: string;
+    action: "sync" | "start";
+    plan_id?: string;
 }
 
 export interface SidecarStartAreasParams {

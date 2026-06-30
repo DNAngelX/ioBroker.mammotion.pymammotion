@@ -18,6 +18,7 @@ from pymammotion.http.http import MammotionHTTP
 from pymammotion.proto import RptAct, RptInfoType
 from pymammotion.transport.base import AuthError, LoginFailedError, ReLoginRequiredError, SessionExpiredError
 from pymammotion.utility.constant.device_constant import PosType, device_connection, device_mode
+from pymammotion.utility.device_config import DeviceConfig
 from pymammotion.utility.device_type import DeviceType
 
 
@@ -36,6 +37,7 @@ class Sidecar:
         self.log_level = "info"
         self.version = "0.1.0"
         self.error_catalog: dict[str, Any] = {}
+        self.device_config = DeviceConfig()
         self._state_subscriptions: list[Any] = []
         self._ready_emitted = False
         self._last_snapshot_at = 0.0
@@ -104,6 +106,9 @@ class Sidecar:
                 await self.respond(request_id, result)
             elif method == "zone_action":
                 result = await self.zone_action(params["device_id"], params["action"])
+                await self.respond(request_id, result)
+            elif method == "plan_action":
+                result = await self.plan_action(params["device_id"], params["action"], params.get("plan_id"))
                 await self.respond(request_id, result)
             elif method == "start_areas":
                 result = await self.start_areas(
@@ -357,6 +362,26 @@ class Sidecar:
                 return False
         return default
 
+    @staticmethod
+    def looks_like_geo_coordinate(latitude: float, longitude: float) -> bool:
+        return -90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0
+
+    def select_global_coordinates(self, location: Any, device: Any) -> tuple[float, float]:
+        device_lat = self.to_float(getattr(getattr(location, "device", None), "latitude", 0.0))
+        device_lon = self.to_float(getattr(getattr(location, "device", None), "longitude", 0.0))
+        rtk_lat = self.to_float(getattr(getattr(location, "RTK", None), "latitude", 0.0) or getattr(device, "lat", 0.0))
+        rtk_lon = self.to_float(getattr(getattr(location, "RTK", None), "longitude", 0.0) or getattr(device, "lon", 0.0))
+
+        if self.looks_like_geo_coordinate(rtk_lat, rtk_lon):
+            if not self.looks_like_geo_coordinate(device_lat, device_lon):
+                return rtk_lat, rtk_lon
+            if abs(device_lat - rtk_lat) > 0.01 or abs(device_lon - rtk_lon) > 0.01:
+                return rtk_lat, rtk_lon
+
+        if self.looks_like_geo_coordinate(device_lat, device_lon):
+            return device_lat, device_lon
+        return rtk_lat, rtk_lon
+
     async def emit_snapshot(self, device_id: str) -> None:
         snapshot = self.get_snapshot(device_id)
         if snapshot is not None:
@@ -381,10 +406,38 @@ class Sidecar:
         area_map = getattr(map_data, "area", {}) or {}
         return sorted(self.to_int(hash_id, 0) for hash_id in area_map.keys() if self.to_int(hash_id, 0) > 0)
 
+    def resolve_public_device_limits(self, device: Any, product_key: str, *extra_keys: Any) -> Any:
+        mower_state = getattr(device, "mower_state", None)
+        candidate_keys: list[str] = []
+        for value in (
+            getattr(mower_state, "sub_model_id", ""),
+            getattr(mower_state, "internal_model", ""),
+            getattr(mower_state, "model", ""),
+            *extra_keys,
+            product_key,
+        ):
+            key = str(value or "").strip()
+            if key and key not in candidate_keys:
+                candidate_keys.append(key)
+
+        for key in candidate_keys:
+            if limits := self.device_config.get_working_parameters(key):
+                return limits
+
+        device_limits = getattr(device, "device_limits", None)
+        if device_limits is not None:
+            return device_limits
+        return self.device_config.get_best_default(product_key)
+
     def build_route_information(self, device_id: str, device: Any, area_hashes: list[int], overrides: dict[str, Any]) -> GenerateRouteInformation:
         work = getattr(device, "work", None)
         mower_state = getattr(device, "mower_state", None)
-        limits = getattr(device, "device_limits", None)
+        limits = self.resolve_public_device_limits(
+            device,
+            self.get_product_key(device),
+            getattr(mower_state, "model", ""),
+            getattr(mower_state, "internal_model", ""),
+        )
         operation_settings = OperationSettings(
             job_mode=self.to_int(overrides.get("jobMode"), self.to_int(getattr(work, "job_mode", 4), 4)),
             job_version=self.to_int(overrides.get("jobVersion"), self.to_int(getattr(work, "job_ver", 0), 0)),
@@ -509,7 +562,6 @@ class Sidecar:
         map_data = getattr(device, "map", None)
         product_key = self.get_product_key(device)
         device_type = self.get_device_type(device_id, product_key)
-        device_limits = getattr(device, "device_limits", None)
 
         firmware = getattr(mower_state, "swversion", "") or getattr(device_firmwares, "device_version", "") or getattr(
             device,
@@ -541,17 +593,55 @@ class Sidecar:
         last_error_code = self.to_int(error_codes[0], 0) if error_codes else 0
         last_error_time = error_times[0] if error_times else 0
         last_error_message, last_error_solution = self.get_error_message(last_error_code)
+        global_latitude, global_longitude = self.select_global_coordinates(location, device)
+        current_work_zone = self.to_int(getattr(location, "work_zone", 0), 0)
+        raw_location_latitude = self.to_float(getattr(getattr(location, "device", None), "latitude", 0.0))
+        raw_location_longitude = self.to_float(getattr(getattr(location, "device", None), "longitude", 0.0))
+        rtk_latitude = self.to_float(getattr(getattr(location, "RTK", None), "latitude", 0.0) or getattr(device, "lat", 0.0))
+        rtk_longitude = self.to_float(getattr(getattr(location, "RTK", None), "longitude", 0.0) or getattr(device, "lon", 0.0))
+        device_limits = self.resolve_public_device_limits(device, product_key, model)
+        path_order_settings = GenerateRouteInformation.decode_path_order(str(getattr(work, "reserved", "") or ""))
+        area_names = {
+            self.to_int(item.hash, 0): str(item.name)
+            for item in getattr(map_data, "area_name", []) or []
+            if self.to_int(getattr(item, "hash", 0), 0) > 0
+        }
+        known_area_hashes = sorted(
+            {
+                self.to_int(hash_id, 0)
+                for hash_id in (
+                    list(getattr(getattr(map_data, "area", {}), "keys", lambda: [])())
+                    + list(selected_zone_hashes)
+                    + ([current_work_zone] if current_work_zone > 0 else [])
+                )
+                if self.to_int(hash_id, 0) > 0
+            }
+        )
+        zones = []
+        for index, hash_id in enumerate(known_area_hashes, start=1):
+            zones.append(
+                {
+                    "hash": hash_id,
+                    "name": area_names.get(hash_id, f"area {index}"),
+                    "order": selected_zone_hashes.index(hash_id) + 1 if hash_id in selected_zone_hashes else 0,
+                    "selected": hash_id in selected_zone_hashes,
+                    "active": hash_id == current_work_zone,
+                }
+            )
+        zone_names_by_hash = {int(zone["hash"]): str(zone["name"]) for zone in zones}
+        current_work_zone_name = zone_names_by_hash.get(current_work_zone, area_names.get(current_work_zone, ""))
 
         telemetry = {
             "batteryLevel": battery_level,
             "bladeHeight": self.to_int(blade_height, 0),
-            "latitude": self.to_float(getattr(getattr(location, "device", None), "latitude", 0.0) or getattr(device, "lat", 0.0)),
-            "longitude": self.to_float(getattr(getattr(location, "device", None), "longitude", 0.0) or getattr(device, "lon", 0.0)),
-            "workZone": self.to_int(getattr(location, "work_zone", 0), 0),
+            "latitude": global_latitude,
+            "longitude": global_longitude,
+            "workZone": current_work_zone,
+            "workZoneName": current_work_zone_name,
             "wifiRssi": self.to_int(getattr(connect, "wifi_rssi", 0) or getattr(device, "wifi_rssi", 0), 0),
             "stateCode": state_code,
-            "rtkLatitude": self.to_float(getattr(getattr(location, "RTK", None), "latitude", 0.0) or getattr(device, "lat", 0.0)),
-            "rtkLongitude": self.to_float(getattr(getattr(location, "RTK", None), "longitude", 0.0) or getattr(device, "lon", 0.0)),
+            "rtkLatitude": rtk_latitude,
+            "rtkLongitude": rtk_longitude,
         }
         capabilities = {
             "isMower": not DeviceType.is_rtk(device_id, product_key) and not DeviceType.is_swimming_pool(device_id),
@@ -582,15 +672,18 @@ class Sidecar:
             "pathHash": self.to_int(getattr(work, "path_hash", 0), 0),
             "pathSpacingHeight": self.to_int(getattr(work, "knife_height", 0), 0),
             "navRunMode": self.to_int(getattr(work, "nav_run_mode", 0), 0),
-            "locationLatitude": self.to_float(getattr(getattr(location, "device", None), "latitude", 0.0)),
-            "locationLongitude": self.to_float(getattr(getattr(location, "device", None), "longitude", 0.0)),
+            "locationLatitude": raw_location_latitude,
+            "locationLongitude": raw_location_longitude,
             "locationYaw": self.to_float(getattr(getattr(location, "device", None), "yaw", 0.0)),
-            "rtkLatitude": self.to_float(getattr(getattr(location, "RTK", None), "latitude", 0.0) or getattr(device, "lat", 0.0)),
-            "rtkLongitude": self.to_float(getattr(getattr(location, "RTK", None), "longitude", 0.0) or getattr(device, "lon", 0.0)),
+            "globalLatitude": global_latitude,
+            "globalLongitude": global_longitude,
+            "rtkLatitude": rtk_latitude,
+            "rtkLongitude": rtk_longitude,
             "positionType": str(PosType(self.to_int(getattr(location, "position_type", 0), 0)).name)
             if self.to_int(getattr(location, "position_type", 0), 0) in {item.value for item in PosType}
             else str(self.to_int(getattr(location, "position_type", 0), 0)),
-            "workZone": self.to_int(getattr(location, "work_zone", 0), 0),
+            "workZone": current_work_zone,
+            "workZoneName": current_work_zone_name,
             "connectionType": self.to_int(getattr(connect, "connect_type", 0), 0),
             "connectionTypeText": device_connection(connect) if connect is not None else "None",
             "usedNet": str(getattr(connect, "used_net", "NONE") or "NONE"),
@@ -617,34 +710,6 @@ class Sidecar:
             "lastErrorSolution": last_error_solution,
             "errorCount": len(error_codes),
         }
-        area_names = {
-            self.to_int(item.hash, 0): str(item.name)
-            for item in getattr(map_data, "area_name", []) or []
-            if self.to_int(getattr(item, "hash", 0), 0) > 0
-        }
-        known_area_hashes = sorted(
-            {
-                self.to_int(hash_id, 0)
-                for hash_id in (
-                    list(getattr(getattr(map_data, "area", {}), "keys", lambda: [])())
-                    + list(selected_zone_hashes)
-                    + ([self.to_int(getattr(location, "work_zone", 0), 0)] if self.to_int(getattr(location, "work_zone", 0), 0) > 0 else [])
-                )
-                if self.to_int(hash_id, 0) > 0
-            }
-        )
-        zones = []
-        for index, hash_id in enumerate(known_area_hashes, start=1):
-            zones.append(
-                {
-                    "hash": hash_id,
-                    "name": area_names.get(hash_id, f"area {index}"),
-                    "order": selected_zone_hashes.index(hash_id) + 1 if hash_id in selected_zone_hashes else 0,
-                    "selected": hash_id in selected_zone_hashes,
-                    "active": hash_id == self.to_int(getattr(location, "work_zone", 0), 0),
-                }
-            )
-
         configuration = {
             "bladeHeight": self.to_int(getattr(work, "knife_height", 0), self.to_int(blade_height, 0)),
             "workingSpeed": self.to_float(getattr(work, "speed", 0.0), self.to_float(getattr(mower_state, "travel_speed", 0.0), 0.0)),
@@ -657,6 +722,11 @@ class Sidecar:
             "towardMode": self.to_int(getattr(work, "toward_mode", 0), 0),
             "towardIncludedAngle": self.to_int(getattr(work, "toward_included_angle", 0), 0),
             "edgeMode": self.to_int(getattr(work, "edge_mode", 0), 0),
+            "borderMode": self.to_int(path_order_settings.edge_mode, 0),
+            "obstacleLaps": self.to_int(path_order_settings.obstacle_laps, 0),
+            "rainTactics": self.to_int(path_order_settings.rain_tactics, 0),
+            "startProgress": self.to_int(path_order_settings.start_progress, 0),
+            "collectGrassFrequency": self.to_int(path_order_settings.collect_grass_freq, 0),
             "rainDetection": bool(getattr(mower_state, "rain_detection", False)),
             "traversalMode": self.to_int(getattr(mower_state, "traversal_mode", 0), 0),
             "turningMode": self.to_int(getattr(mower_state, "turning_mode", 0), 0),
@@ -681,6 +751,67 @@ class Sidecar:
             "pathSpacingMax": self.to_int(getattr(getattr(device_limits, "path_spacing", None), "max", 0), 0),
             "maxAreaCount": self.to_int(getattr(device_limits, "work_area_num_max", 0), 0),
         }
+        plans = []
+        for fallback_index, plan in enumerate((getattr(map_data, "plan", {}) or {}).values(), start=1):
+            plan_id = str(getattr(plan, "plan_id", "") or getattr(plan, "id", "") or f"plan-{fallback_index}")
+            zone_hashes = [self.to_int(hash_id, 0) for hash_id in getattr(plan, "zone_hashs", []) if self.to_int(hash_id, 0) > 0]
+            zone_names = [zone_names_by_hash.get(hash_id, area_names.get(hash_id, str(hash_id))) for hash_id in zone_hashes]
+            plan_name = (
+                str(getattr(plan, "task_name", "") or "").strip()
+                or str(getattr(plan, "job_name", "") or "").strip()
+                or f"plan {self.to_int(getattr(plan, 'plan_index', fallback_index), fallback_index)}"
+            )
+            plans.append(
+                {
+                    "id": plan_id,
+                    "name": plan_name,
+                    "info": {
+                        "planId": plan_id,
+                        "taskId": str(getattr(plan, "task_id", "") or ""),
+                        "jobId": str(getattr(plan, "job_id", "") or ""),
+                        "taskName": str(getattr(plan, "task_name", "") or ""),
+                        "jobName": str(getattr(plan, "job_name", "") or ""),
+                        "area": self.to_int(getattr(plan, "area", 0), 0),
+                        "requiredTime": self.to_int(getattr(plan, "required_time", 0), 0),
+                        "workTime": self.to_int(getattr(plan, "work_time", 0), 0),
+                        "planIndex": self.to_int(getattr(plan, "plan_index", fallback_index), fallback_index),
+                    },
+                    "schedule": {
+                        "startTime": str(getattr(plan, "start_time", "") or ""),
+                        "endTime": str(getattr(plan, "end_time", "") or ""),
+                        "startDate": str(getattr(plan, "start_date", "") or ""),
+                        "endDate": str(getattr(plan, "end_date", "") or ""),
+                        "week": self.to_int(getattr(plan, "week", 0), 0),
+                        "weeks": ",".join(str(self.to_int(week, 0)) for week in getattr(plan, "weeks", []) or []),
+                        "day": self.to_int(getattr(plan, "day", 0), 0),
+                        "triggerType": self.to_int(getattr(plan, "trigger_type", 0), 0),
+                        "remainedSeconds": self.to_int(getattr(plan, "remained_seconds", 0), 0),
+                    },
+                    "configuration": {
+                        "bladeHeight": self.to_int(getattr(plan, "knife_height", 0), 0),
+                        "workingSpeed": self.to_float(getattr(plan, "speed", 0.0), 0.0),
+                        "pathSpacing": self.to_int(getattr(plan, "route_spacing", 0), 0),
+                        "jobMode": self.to_int(getattr(plan, "model", 0), 0),
+                        "ultraWave": self.to_int(getattr(plan, "ultrasonic_barrier", 0), 0),
+                        "edgeMode": self.to_int(getattr(plan, "edge_mode", 0), 0),
+                        "toward": self.to_int(getattr(plan, "route_angle", 0), 0),
+                        "towardMode": self.to_int(getattr(plan, "toward_mode", 0), 0),
+                        "towardIncludedAngle": self.to_int(getattr(plan, "toward_included_angle", 0), 0),
+                        "routeModel": self.to_int(getattr(plan, "route_model", 0), 0),
+                    },
+                    "zones": {
+                        "count": len(zone_hashes),
+                        "hashes": ",".join(str(hash_id) for hash_id in zone_hashes),
+                        "names": ",".join(zone_names),
+                    },
+                }
+            )
+        plans.sort(
+            key=lambda item: (
+                self.to_int(item.get("info", {}).get("planIndex", 0), 0),
+                str(item.get("name", "")).lower(),
+            )
+        )
         return {
             "id": device_id,
             "name": device.name or device_id,
@@ -705,6 +836,7 @@ class Sidecar:
             "configuration": configuration,
             "configurationLimits": configuration_limits,
             "zones": zones,
+            "plans": plans,
         }
 
     async def send_command(self, device_id: str, command: str) -> dict[str, Any]:
@@ -829,6 +961,31 @@ class Sidecar:
 
         await self.persist_cache()
         result = {"ok": True, "device_id": device_id, "command": action}
+        await self.emit("command_result", result)
+        await self.emit_snapshot(device_id)
+        return result
+
+    async def plan_action(self, device_id: str, action: str, plan_id: str | None = None) -> dict[str, Any]:
+        if self.client is None:
+            raise JsonRpcError("Client is not initialized")
+
+        if action == "sync":
+            await self.client.start_plan_sync(device_id)
+        elif action == "start":
+            if not plan_id:
+                raise JsonRpcError("Missing plan_id for plan start")
+            await self.client.send_command_with_args(device_id, "single_schedule", plan_id=plan_id)
+            await asyncio.sleep(1)
+        else:
+            raise JsonRpcError(f"Unsupported plan action: {action}")
+
+        await self.persist_cache()
+        result = {
+            "ok": True,
+            "device_id": device_id,
+            "command": f"plan:{action}",
+            "message": plan_id or "",
+        }
         await self.emit("command_result", result)
         await self.emit_snapshot(device_id)
         return result

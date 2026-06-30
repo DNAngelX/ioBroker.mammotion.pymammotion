@@ -37,6 +37,42 @@ const SESSION_WATCHDOG_INTERVAL_MS = 6e4;
 const SESSION_WATCHDOG_FAILURE_LIMIT = 2;
 const SESSION_WATCHDOG_OFFLINE_LIMIT = 3;
 const SESSION_RECOVERY_COOLDOWN_MS = 9e4;
+const ZONE_START_CONFIGURATION_FIELDS = [
+  { stateKey: "bladeHeight", payloadKey: "bladeHeight", snapshotKey: "bladeHeight", legacyKeys: ["bladeHeight"] },
+  { stateKey: "workingSpeed", payloadKey: "workingSpeed", snapshotKey: "workingSpeed", legacyKeys: ["workingSpeed", "speed"] },
+  { stateKey: "pathSpacing", payloadKey: "pathSpacing", snapshotKey: "pathSpacing", legacyKeys: ["pathSpacing", "channelWidth"] },
+  { stateKey: "pathOrder", payloadKey: "jobMode", snapshotKey: "jobMode", legacyKeys: ["pathOrder", "jobMode"] },
+  { stateKey: "cuttingPathMode", payloadKey: "channelMode", snapshotKey: "channelMode", legacyKeys: ["cuttingPathMode", "channelMode"] },
+  {
+    stateKey: "obstacleDetectionMode",
+    payloadKey: "ultraWave",
+    snapshotKey: "ultraWave",
+    legacyKeys: ["obstacleDetectionMode", "ultraWave"]
+  },
+  { stateKey: "cuttingPathAngle", payloadKey: "toward", snapshotKey: "toward", legacyKeys: ["cuttingPathAngle", "toward"] },
+  {
+    stateKey: "cuttingPathAngleMode",
+    payloadKey: "towardMode",
+    snapshotKey: "towardMode",
+    legacyKeys: ["cuttingPathAngleMode", "towardMode"]
+  },
+  {
+    stateKey: "crossingAngle",
+    payloadKey: "towardIncludedAngle",
+    snapshotKey: "towardIncludedAngle",
+    legacyKeys: ["crossingAngle", "towardIncludedAngle"]
+  },
+  { stateKey: "boundaryLaps", payloadKey: "borderMode", snapshotKey: "borderMode", legacyKeys: ["boundaryLaps", "borderMode"] },
+  { stateKey: "noGoZoneLaps", payloadKey: "obstacleLaps", snapshotKey: "obstacleLaps", legacyKeys: ["noGoZoneLaps", "obstacleLaps"] },
+  { stateKey: "perimeterLaps", payloadKey: "mowingLaps", snapshotKey: "edgeMode", legacyKeys: ["perimeterLaps", "mowingLaps", "edgeMode"] },
+  { stateKey: "startProgress", payloadKey: "startProgress", snapshotKey: "startProgress", legacyKeys: ["startProgress"] },
+  {
+    stateKey: "collectGrassFrequency",
+    payloadKey: "collectGrassFrequency",
+    snapshotKey: "collectGrassFrequency",
+    legacyKeys: ["collectGrassFrequency"]
+  }
+];
 class MammotionPyMammotion extends utils.Adapter {
   sidecar = null;
   deviceSnapshots = /* @__PURE__ */ new Map();
@@ -69,6 +105,8 @@ class MammotionPyMammotion extends utils.Adapter {
     await this.subscribeStatesAsync("devices.*.configuration.*");
     await this.subscribeStatesAsync("devices.*.configuration.limits.*");
     await this.subscribeStatesAsync("devices.*.zones.*");
+    await this.subscribeStatesAsync("devices.*.zones.config.*");
+    await this.subscribeStatesAsync("devices.*.plans.*");
     await this.subscribeStatesAsync("diagnostics.*");
     try {
       const instanceDataDir = utils.getAbsoluteInstanceDataDir(this);
@@ -474,6 +512,11 @@ class MammotionPyMammotion extends utils.Adapter {
       void this.executeZoneValueWrite(parsedZoneValue.deviceId, parsedZoneValue.field, state, parsedZoneValue.stateId);
       return;
     }
+    const parsedZoneStartConfig = this.parseZoneStartConfigId(id);
+    if (parsedZoneStartConfig) {
+      void this.executeZoneStartConfigWrite(parsedZoneStartConfig.stateId, state);
+      return;
+    }
     const parsedZoneConfig = this.parseZoneConfigId(id);
     if (parsedZoneConfig) {
       void this.executeZoneConfigWrite(
@@ -483,6 +526,15 @@ class MammotionPyMammotion extends utils.Adapter {
         state,
         parsedZoneConfig.stateId
       );
+      return;
+    }
+    const parsedPlanAction = this.parsePlanActionId(id);
+    if (parsedPlanAction) {
+      if (state.val !== true) {
+        void this.setStateChangedAsync(parsedPlanAction.stateId, false, true);
+        return;
+      }
+      void this.executePlanAction(parsedPlanAction.deviceId, parsedPlanAction.action, parsedPlanAction.stateId);
       return;
     }
     const parsed = this.parseCommandId(id);
@@ -534,6 +586,16 @@ class MammotionPyMammotion extends utils.Adapter {
       stateId: localId
     };
   }
+  parseZoneStartConfigId(id) {
+    const localId = id.replace(`${this.namespace}.`, "");
+    const match = localId.match(/^devices\.([^.]+)\.zones\.config\.([^.]+)$/);
+    if (!match) {
+      return null;
+    }
+    return {
+      stateId: localId
+    };
+  }
   parseZoneConfigId(id) {
     var _a;
     const localId = id.replace(`${this.namespace}.`, "");
@@ -545,6 +607,27 @@ class MammotionPyMammotion extends utils.Adapter {
       deviceId: (_a = this.deviceChannels.get(match[1])) != null ? _a : match[1],
       zoneHash: Number(match[2]),
       field: match[3],
+      stateId: localId
+    };
+  }
+  parsePlanActionId(id) {
+    var _a, _b;
+    const localId = id.replace(`${this.namespace}.`, "");
+    const syncMatch = localId.match(/^devices\.([^.]+)\.plans\.sync$/);
+    if (syncMatch) {
+      return {
+        deviceId: (_a = this.deviceChannels.get(syncMatch[1])) != null ? _a : syncMatch[1],
+        action: "sync",
+        stateId: localId
+      };
+    }
+    const startMatch = localId.match(/^devices\.([^.]+)\.plans\.plan_[^.]+\.commands\.start$/);
+    if (!startMatch) {
+      return null;
+    }
+    return {
+      deviceId: (_b = this.deviceChannels.get(startMatch[1])) != null ? _b : startMatch[1],
+      action: "start",
       stateId: localId
     };
   }
@@ -583,6 +666,40 @@ class MammotionPyMammotion extends utils.Adapter {
       await this.setStateChangedAsync(stateId, false, true);
     }
   }
+  async executePlanAction(deviceId, action, stateId) {
+    try {
+      if (!this.sidecar) {
+        throw new Error("Sidecar is not running");
+      }
+      const params = action === "start" ? {
+        device_id: deviceId,
+        action,
+        plan_id: await this.resolvePlanIdFromState(stateId)
+      } : {
+        device_id: deviceId,
+        action
+      };
+      await this.sidecar.planAction(params);
+      const snapshotResult = await this.sidecar.getSnapshot({ device_id: deviceId });
+      if (snapshotResult.snapshot) {
+        await this.applySnapshot(snapshotResult.snapshot);
+      }
+    } catch (error) {
+      await this.setStateChangedAsync("info.lastError", String(error), true);
+      this.log.warn(`Plan action ${action} failed for ${deviceId}: ${String(error)}`);
+    } finally {
+      await this.setStateChangedAsync(stateId, false, true);
+    }
+  }
+  async resolvePlanIdFromState(stateId) {
+    const planChannelId = stateId.replace(/\.commands\.start$/, "");
+    const object = await this.getObjectAsync(planChannelId);
+    const planId = (object == null ? void 0 : object.native) && typeof object.native === "object" ? object.native.planId : void 0;
+    if (typeof planId === "string" && planId.trim()) {
+      return planId;
+    }
+    throw new Error(`Plan ID not found for ${planChannelId}`);
+  }
   async executeConfigurationWrite(deviceId, key, state, stateId) {
     var _a;
     try {
@@ -604,8 +721,16 @@ class MammotionPyMammotion extends utils.Adapter {
       this.log.warn(`Configuration write ${key} failed for ${deviceId}: ${String(error)}`);
     }
   }
+  async executeZoneStartConfigWrite(stateId, state) {
+    try {
+      await this.setStateChangedAsync(stateId, state.val, true);
+    } catch (error) {
+      await this.setStateChangedAsync("info.lastError", String(error), true);
+      this.log.warn(`Zone start config write failed for ${stateId}: ${String(error)}`);
+    }
+  }
   async executeZoneAction(deviceId, action, stateId) {
-    var _a;
+    var _a, _b, _c;
     try {
       if (!this.sidecar) {
         throw new Error("Sidecar is not running");
@@ -621,11 +746,22 @@ class MammotionPyMammotion extends utils.Adapter {
         const payloadState = await this.getStateAsync(`devices.${channelId}.zones.startPayload`);
         const payload = this.parseZoneStartPayload(payloadState == null ? void 0 : payloadState.val);
         const selectedAreas = action === "startAll" ? [] : (0, import_zone_selection.parseAreaSelection)((_a = payload == null ? void 0 : payload.areas) != null ? _a : selectedState == null ? void 0 : selectedState.val);
-        const overrides = payload ? this.extractZoneOverrides(payload) : void 0;
-        const startImmediately = typeof (payload == null ? void 0 : payload.startImmediately) === "boolean" ? Boolean(payload.startImmediately) : true;
+        const zoneStartConfig = await this.buildZoneStartConfiguration(deviceId, selectedAreas);
+        const payloadOverrides = payload ? this.extractZoneOverrides(payload) : void 0;
+        const overrides = zoneStartConfig.overrides || payloadOverrides ? {
+          ...(_b = zoneStartConfig.overrides) != null ? _b : {},
+          ...payloadOverrides != null ? payloadOverrides : {}
+        } : void 0;
+        const startImmediately = typeof (payload == null ? void 0 : payload.startImmediately) === "boolean" ? Boolean(payload.startImmediately) : zoneStartConfig.startImmediately;
+        const effectiveAreas = action === "startAll" ? (0, import_zone_selection.parseAreaSelection)(payload == null ? void 0 : payload.areas) : (0, import_zone_selection.parseAreaSelection)((_c = payload == null ? void 0 : payload.areas) != null ? _c : zoneStartConfig.areas);
+        await this.setStateChangedAsync(
+          `devices.${channelId}.zones.startPayload`,
+          this.buildReadableZoneStartPayload(effectiveAreas, startImmediately, overrides),
+          true
+        );
         await this.sidecar.startAreas({
           device_id: deviceId,
-          area_hashes: selectedAreas,
+          area_hashes: effectiveAreas,
           overrides,
           start_immediately: startImmediately
         });
@@ -662,11 +798,68 @@ class MammotionPyMammotion extends utils.Adapter {
       if (key === "areas" || key === "startImmediately") {
         continue;
       }
+      const normalizedKey = this.normalizeZoneOverrideKey(key);
+      if (!normalizedKey) {
+        continue;
+      }
       if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || value === null) {
-        overrides[key] = value;
+        overrides[normalizedKey] = value;
       }
     }
     return Object.keys(overrides).length ? overrides : void 0;
+  }
+  normalizeZoneOverrideKey(key) {
+    var _a;
+    const field = ZONE_START_CONFIGURATION_FIELDS.find((entry) => entry.legacyKeys.includes(key));
+    return (_a = field == null ? void 0 : field.payloadKey) != null ? _a : null;
+  }
+  async buildZoneStartConfiguration(deviceId, selectedAreas) {
+    var _a, _b;
+    const snapshot = this.deviceSnapshots.get(deviceId);
+    const channelId = (0, import_object_model.normalizeDeviceChannelId)(deviceId);
+    const overrides = {};
+    for (const field of ZONE_START_CONFIGURATION_FIELDS) {
+      const state = await this.getStateAsync(`devices.${channelId}.zones.config.${field.stateKey}`);
+      const legacyValue = await this.getLegacyZoneConfigValue(channelId, field);
+      const value = (_b = (_a = state == null ? void 0 : state.val) != null ? _a : legacyValue) != null ? _b : snapshot && field.snapshotKey ? snapshot.configuration[field.snapshotKey] : void 0;
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || value === null) {
+        if (value === "") {
+          continue;
+        }
+        overrides[field.payloadKey] = value;
+      }
+    }
+    const startImmediatelyState = await this.getStateAsync(`devices.${channelId}.zones.config.startImmediately`);
+    return {
+      areas: selectedAreas,
+      overrides: Object.keys(overrides).length ? overrides : void 0,
+      startImmediately: typeof (startImmediatelyState == null ? void 0 : startImmediatelyState.val) === "boolean" ? Boolean(startImmediatelyState.val) : true
+    };
+  }
+  async getLegacyZoneConfigValue(channelId, field) {
+    for (const legacyKey of field.legacyKeys) {
+      if (legacyKey === field.stateKey) {
+        continue;
+      }
+      const legacyState = await this.getStateAsync(`devices.${channelId}.zones.config.${legacyKey}`);
+      if ((legacyState == null ? void 0 : legacyState.val) !== null && (legacyState == null ? void 0 : legacyState.val) !== void 0 && legacyState.val !== "") {
+        return legacyState.val;
+      }
+    }
+    return void 0;
+  }
+  buildReadableZoneStartPayload(areas, startImmediately, overrides) {
+    const payload = {
+      areas,
+      startImmediately
+    };
+    for (const field of ZONE_START_CONFIGURATION_FIELDS) {
+      const value = overrides == null ? void 0 : overrides[field.payloadKey];
+      if (value !== void 0) {
+        payload[field.stateKey] = value;
+      }
+    }
+    return JSON.stringify(payload);
   }
   async executeZoneValueWrite(deviceId, field, state, stateId) {
     var _a;

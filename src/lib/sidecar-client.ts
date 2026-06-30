@@ -16,6 +16,7 @@ import {
     SidecarListDevicesResult,
     SidecarLoginParams,
     SidecarLoginResult,
+    SidecarPlanActionParams,
     SidecarSetSettingParams,
     SidecarSendCommandParams,
     SidecarStartAreasParams,
@@ -150,6 +151,10 @@ export class SidecarClient extends EventEmitter {
 
     public zoneAction(params: SidecarZoneActionParams): Promise<SidecarCommandResult> {
         return this.request("zone_action", params);
+    }
+
+    public planAction(params: SidecarPlanActionParams): Promise<SidecarCommandResult> {
+        return this.request("plan_action", params);
     }
 
     public startAreas(params: SidecarStartAreasParams): Promise<SidecarCommandResult> {

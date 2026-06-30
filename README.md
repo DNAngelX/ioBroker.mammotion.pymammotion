@@ -150,6 +150,7 @@ If `areas` is omitted, `startSelected` uses `zones.selectedAreas`.
 ## Changelog
 
 ### **WORK IN PROGRESS**
+* Initial release
 
 ### 0.0.1 (2026-06-30)
 * Initial sidecar-based release using PyMammotion

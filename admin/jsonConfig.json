@@ -40,11 +40,7 @@
                     "jsonData": "{}",
                     "result": "{}",
                     "newLine": true,
-                    "variant": "contained",
-                    "icon": "search",
-                    "container": "text",
-                    "containerAttr": "result",
-                    "copyToClipboard": false
+                    "variant": "contained"
                 },
                 "installHintHeader": {
                     "type": "staticText",

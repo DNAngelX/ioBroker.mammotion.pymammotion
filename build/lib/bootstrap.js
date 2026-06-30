@@ -193,6 +193,11 @@ async function bootstrapPythonEnvironment(options) {
     }
     options.log.info(`Creating Python virtual environment with ${version.raw}`);
     await execFileAsync(version.executable, ["-m", "venv", venvPaths.root]);
+    try {
+      await execFileAsync(venvPaths.python, ["-m", "ensurepip", "--upgrade"]);
+    } catch {
+      options.log.debug("ensurepip not available or pip already present, continuing");
+    }
   }
   const stampExists = (0, import_node_fs.existsSync)(venvPaths.stamp);
   const installedHash = stampExists ? await import_promises.default.readFile(venvPaths.stamp, "utf8") : "";

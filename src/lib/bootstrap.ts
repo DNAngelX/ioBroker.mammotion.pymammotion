@@ -201,6 +201,12 @@ export async function bootstrapPythonEnvironment(options: BootstrapOptions): Pro
         }
         options.log.info(`Creating Python virtual environment with ${version.raw}`);
         await execFileAsync(version.executable, ["-m", "venv", venvPaths.root]);
+        // Ensure pip is available — some system Python packages omit it from venvs
+        try {
+            await execFileAsync(venvPaths.python, ["-m", "ensurepip", "--upgrade"]);
+        } catch {
+            options.log.debug("ensurepip not available or pip already present, continuing");
+        }
     }
 
     const stampExists = existsSync(venvPaths.stamp);

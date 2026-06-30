@@ -63,7 +63,7 @@
                     "newLine": true,
                     "disabled": true,
                     "label": "installCmdLinuxLabel",
-                    "defaultFunc": "return 'sudo apt install python3.13 python3.13-venv python3-setuptools'",
+                    "defaultFunc": "return 'sudo apt install python3.13 python3.13-venv python3.13-distutils python3-setuptools'",
                     "noTranslation": true,
                     "style": { "fontFamily": "monospace" }
                 },

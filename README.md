@@ -147,6 +147,13 @@ If `areas` is omitted, `startSelected` uses `zones.selectedAreas`.
 - That is a cloud/backend issue and should not crash the adapter.
 - In that case, retry the sync later.
 
+## Changelog
+
+### **WORK IN PROGRESS**
+
+### 0.0.1 (2026-06-30)
+* Initial sidecar-based release using PyMammotion
+
 ## Notes
 
 - The adapter expects Python to already be installed; it does not install system Python.

@@ -3,8 +3,8 @@
   "version": "0.0.1",
   "description": "ioBroker adapter for Mammotion devices using a PyMammotion sidecar",
   "author": {
-    "name": "Lenny",
-    "email": "lenny@example.com"
+    "name": "DNAngel",
+    "email": "stolly82@web.de"
   },
   "homepage": "https://github.com/DNAngelX/ioBroker.mammotion.pymammotion",
   "license": "GPL-3.0-only",

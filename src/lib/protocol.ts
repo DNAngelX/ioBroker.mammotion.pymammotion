@@ -85,6 +85,21 @@ export interface SidecarHealthResult {
     python_version: string;
 }
 
+export interface SidecarValidateConnectionParams {
+    probe?: boolean;
+}
+
+export interface SidecarValidateConnectionResult {
+    ok: boolean;
+    authenticated: boolean;
+    device_count: number;
+    online_devices: number;
+    probe: string;
+    last_snapshot_at: string;
+    last_snapshot_age_sec: number;
+    message?: string;
+}
+
 export interface SidecarLoginParams {
     account: string;
     password: string;

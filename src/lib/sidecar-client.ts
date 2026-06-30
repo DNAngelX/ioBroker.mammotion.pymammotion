@@ -19,12 +19,15 @@ import {
     SidecarSetSettingParams,
     SidecarSendCommandParams,
     SidecarStartAreasParams,
+    SidecarValidateConnectionParams,
+    SidecarValidateConnectionResult,
     SidecarZoneActionParams,
 } from "./protocol";
 
 interface PendingRequest {
     resolve: (value: any) => void;
     reject: (reason?: unknown) => void;
+    timeout: NodeJS.Timeout;
 }
 
 export interface SidecarClientOptions {
@@ -73,6 +76,7 @@ export class SidecarClient extends EventEmitter {
         this.child.once("exit", (code, signal) => {
             const error = new Error(`Sidecar exited with code ${code ?? "null"} signal ${signal ?? "null"}`);
             for (const pending of this.pending.values()) {
+                clearTimeout(pending.timeout);
                 pending.reject(error);
             }
             this.pending.clear();
@@ -85,7 +89,22 @@ export class SidecarClient extends EventEmitter {
         if (!this.child) {
             return;
         }
-        this.child.kill();
+        const child = this.child;
+        const exited = new Promise<void>((resolve) => {
+            child.once("exit", () => resolve());
+        });
+        child.kill();
+        await Promise.race([
+            exited,
+            new Promise<void>((resolve) => {
+                setTimeout(() => {
+                    if (child.exitCode === null && !child.killed) {
+                        child.kill("SIGKILL");
+                    }
+                    resolve();
+                }, 5_000);
+            }),
+        ]);
         this.child = null;
     }
 
@@ -95,6 +114,10 @@ export class SidecarClient extends EventEmitter {
 
     public health(): Promise<SidecarHealthResult> {
         return this.request("health");
+    }
+
+    public validateConnection(params: SidecarValidateConnectionParams = {}): Promise<SidecarValidateConnectionResult> {
+        return this.request("validate_connection", params);
     }
 
     public bootstrap(params: SidecarBootstrapParams): Promise<SidecarBootstrapResult> {
@@ -144,6 +167,7 @@ export class SidecarClient extends EventEmitter {
                 return;
             }
             this.pending.delete(parsed.id);
+            clearTimeout(pending.timeout);
             if (parsed.error) {
                 pending.reject(new Error(parsed.error.message));
                 return;
@@ -165,7 +189,14 @@ export class SidecarClient extends EventEmitter {
             params,
         };
         return new Promise<TResult>((resolve, reject) => {
-            this.pending.set(id, { resolve, reject });
+            const timeout = setTimeout(() => {
+                if (!this.pending.has(id)) {
+                    return;
+                }
+                this.pending.delete(id);
+                reject(new Error(`Sidecar request timed out: ${method}`));
+            }, 30_000);
+            this.pending.set(id, { resolve, reject, timeout });
             this.child?.stdin.write(`${JSON.stringify(message)}\n`);
         });
     }

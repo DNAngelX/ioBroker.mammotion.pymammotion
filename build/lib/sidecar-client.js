@@ -63,6 +63,7 @@ class SidecarClient extends import_node_events.EventEmitter {
     this.child.once("exit", (code, signal) => {
       const error = new Error(`Sidecar exited with code ${code != null ? code : "null"} signal ${signal != null ? signal : "null"}`);
       for (const pending of this.pending.values()) {
+        clearTimeout(pending.timeout);
         pending.reject(error);
       }
       this.pending.clear();
@@ -74,7 +75,22 @@ class SidecarClient extends import_node_events.EventEmitter {
     if (!this.child) {
       return;
     }
-    this.child.kill();
+    const child = this.child;
+    const exited = new Promise((resolve) => {
+      child.once("exit", () => resolve());
+    });
+    child.kill();
+    await Promise.race([
+      exited,
+      new Promise((resolve) => {
+        setTimeout(() => {
+          if (child.exitCode === null && !child.killed) {
+            child.kill("SIGKILL");
+          }
+          resolve();
+        }, 5e3);
+      })
+    ]);
     this.child = null;
   }
   async shutdown() {
@@ -82,6 +98,9 @@ class SidecarClient extends import_node_events.EventEmitter {
   }
   health() {
     return this.request("health");
+  }
+  validateConnection(params = {}) {
+    return this.request("validate_connection", params);
   }
   bootstrap(params) {
     return this.request("bootstrap", params);
@@ -121,6 +140,7 @@ class SidecarClient extends import_node_events.EventEmitter {
         return;
       }
       this.pending.delete(parsed.id);
+      clearTimeout(pending.timeout);
       if (parsed.error) {
         pending.reject(new Error(parsed.error.message));
         return;
@@ -142,7 +162,14 @@ class SidecarClient extends import_node_events.EventEmitter {
     };
     return new Promise((resolve, reject) => {
       var _a;
-      this.pending.set(id, { resolve, reject });
+      const timeout = setTimeout(() => {
+        if (!this.pending.has(id)) {
+          return;
+        }
+        this.pending.delete(id);
+        reject(new Error(`Sidecar request timed out: ${method}`));
+      }, 3e4);
+      this.pending.set(id, { resolve, reject, timeout });
       (_a = this.child) == null ? void 0 : _a.stdin.write(`${JSON.stringify(message)}
 `);
     });

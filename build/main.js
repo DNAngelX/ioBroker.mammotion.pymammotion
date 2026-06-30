@@ -33,15 +33,25 @@ const RESTART_WINDOW_MS = 10 * 60 * 1e3;
 const RESTART_LIMIT = 5;
 const RESTART_BACKOFF_BASE_MS = 2e3;
 const RESTART_BACKOFF_MAX_MS = 6e4;
+const SESSION_WATCHDOG_INTERVAL_MS = 6e4;
+const SESSION_WATCHDOG_FAILURE_LIMIT = 2;
+const SESSION_WATCHDOG_OFFLINE_LIMIT = 3;
+const SESSION_RECOVERY_COOLDOWN_MS = 9e4;
 class MammotionPyMammotion extends utils.Adapter {
   sidecar = null;
   deviceSnapshots = /* @__PURE__ */ new Map();
   deviceChannels = /* @__PURE__ */ new Map();
   sidecarStopRequested = false;
+  controlledSidecarExit = false;
   restartTimer;
+  watchdogTimer;
   restartAttempt = 0;
   restartHistory = [];
   bootstrappedPython = "";
+  sessionValidationFailures = 0;
+  sessionOfflineChecks = 0;
+  sessionRecoveryInProgress = false;
+  lastSessionRecoveryAt = 0;
   constructor(options = {}) {
     super({
       ...options,
@@ -84,6 +94,7 @@ class MammotionPyMammotion extends utils.Adapter {
         this.clearTimeout(this.restartTimer);
         this.restartTimer = void 0;
       }
+      this.stopSessionWatchdog();
       if (this.sidecar) {
         await this.sidecar.shutdown().catch(() => void 0);
         await this.sidecar.stop().catch(() => void 0);
@@ -167,6 +178,7 @@ class MammotionPyMammotion extends utils.Adapter {
       await this.setStateChangedAsync("info.connection", false, true);
       await this.setStateChangedAsync("info.lastError", message, true);
       this.restartAttempt = 0;
+      this.stopSessionWatchdog();
       return;
     }
     const cachePath = import_node_path.default.join(utils.getAbsoluteInstanceDataDir(this), "pymammotion-cache.json");
@@ -179,7 +191,10 @@ class MammotionPyMammotion extends utils.Adapter {
     await this.setStateChangedAsync("info.authenticated", Boolean(loginResult.authenticated), true);
     await this.refreshDeviceList();
     this.restartAttempt = 0;
+    this.sessionValidationFailures = 0;
+    this.sessionOfflineChecks = 0;
     await this.setStateChangedAsync("info.lastError", "", true);
+    this.ensureSessionWatchdog();
   }
   attachSidecarHandlers(sidecar) {
     sidecar.on("notification", (message) => {
@@ -197,6 +212,11 @@ class MammotionPyMammotion extends utils.Adapter {
   async handleSidecarExit(code, signal) {
     await this.setStateChangedAsync("info.sidecarReady", false, true);
     await this.setStateChangedAsync("info.connection", false, true);
+    this.stopSessionWatchdog();
+    if (this.controlledSidecarExit) {
+      this.controlledSidecarExit = false;
+      return;
+    }
     if (this.sidecarStopRequested) {
       return;
     }
@@ -234,6 +254,85 @@ class MammotionPyMammotion extends utils.Adapter {
       await this.handleFatalError(error, "Sidecar restart failed");
     }
   }
+  ensureSessionWatchdog() {
+    if (this.watchdogTimer) {
+      return;
+    }
+    this.watchdogTimer = this.setInterval(() => {
+      void this.runSessionWatchdog();
+    }, SESSION_WATCHDOG_INTERVAL_MS);
+  }
+  stopSessionWatchdog() {
+    if (!this.watchdogTimer) {
+      return;
+    }
+    this.clearInterval(this.watchdogTimer);
+    this.watchdogTimer = void 0;
+  }
+  async runSessionWatchdog() {
+    if (!this.sidecar || this.sidecarStopRequested || this.sessionRecoveryInProgress || !this.config.email || !this.config.password) {
+      return;
+    }
+    try {
+      const validation = await this.sidecar.validateConnection({ probe: true });
+      if (!validation.authenticated) {
+        throw new Error(validation.message || "Sidecar is not authenticated");
+      }
+      this.sessionValidationFailures = 0;
+      if (validation.device_count > 0 && validation.online_devices === 0) {
+        this.sessionOfflineChecks += 1;
+        this.log.debug(
+          `Session watchdog: no online devices (${this.sessionOfflineChecks}/${SESSION_WATCHDOG_OFFLINE_LIMIT}), probe=${validation.probe}, lastSnapshotAge=${validation.last_snapshot_age_sec}s`
+        );
+        if (this.sessionOfflineChecks >= SESSION_WATCHDOG_OFFLINE_LIMIT) {
+          await this.triggerSessionRecovery("all devices remained offline");
+        }
+        return;
+      }
+      this.sessionOfflineChecks = 0;
+    } catch (error) {
+      this.sessionValidationFailures += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      await this.setStateChangedAsync("info.lastError", `Session watchdog: ${message}`, true);
+      this.log.warn(
+        `Session watchdog validation failed (${this.sessionValidationFailures}/${SESSION_WATCHDOG_FAILURE_LIMIT}): ${message}`
+      );
+      if (this.sessionValidationFailures >= SESSION_WATCHDOG_FAILURE_LIMIT) {
+        await this.triggerSessionRecovery(`watchdog validation failed: ${message}`);
+      }
+    }
+  }
+  async triggerSessionRecovery(reason) {
+    if (this.sessionRecoveryInProgress || this.sidecarStopRequested) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastSessionRecoveryAt < SESSION_RECOVERY_COOLDOWN_MS) {
+      this.log.debug(`Skipping session recovery during cooldown: ${reason}`);
+      return;
+    }
+    this.sessionRecoveryInProgress = true;
+    this.lastSessionRecoveryAt = now;
+    this.stopSessionWatchdog();
+    this.log.warn(`Recovering Mammotion session: ${reason}`);
+    await this.setStateChangedAsync("info.connection", false, true);
+    await this.setStateChangedAsync("info.authenticated", false, true);
+    try {
+      if (this.sidecar) {
+        this.controlledSidecarExit = true;
+        await this.sidecar.shutdown().catch(() => void 0);
+        await this.sidecar.stop().catch(() => void 0);
+        this.sidecar = null;
+      }
+      await this.startSidecar();
+    } catch (error) {
+      await this.handleFatalError(error, `Session recovery failed (${reason})`);
+    } finally {
+      this.sessionValidationFailures = 0;
+      this.sessionOfflineChecks = 0;
+      this.sessionRecoveryInProgress = false;
+    }
+  }
   async refreshDeviceList() {
     if (!this.sidecar) {
       return;
@@ -257,6 +356,7 @@ class MammotionPyMammotion extends utils.Adapter {
         await this.setStateChangedAsync("info.authenticated", payload.authenticated, true);
         if (!payload.authenticated && payload.message) {
           await this.setStateChangedAsync("info.lastError", payload.message, true);
+          void this.triggerSessionRecovery(`sidecar authentication lost: ${payload.message}`);
         }
         break;
       }
@@ -689,9 +789,11 @@ class MammotionPyMammotion extends utils.Adapter {
   async handleFatalError(error, prefix) {
     const message = error instanceof Error ? error.message : String(error);
     this.log.error(`${prefix}: ${message}`);
+    this.stopSessionWatchdog();
     await this.setStateChangedAsync("info.lastError", `${prefix}: ${message}`, true);
     await this.setStateChangedAsync("info.connection", false, true);
     await this.setStateChangedAsync("info.sidecarReady", false, true);
+    await this.setStateChangedAsync("info.authenticated", false, true);
   }
 }
 if (require.main !== module) {

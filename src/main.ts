@@ -17,16 +17,26 @@ const RESTART_WINDOW_MS = 10 * 60 * 1000;
 const RESTART_LIMIT = 5;
 const RESTART_BACKOFF_BASE_MS = 2_000;
 const RESTART_BACKOFF_MAX_MS = 60_000;
+const SESSION_WATCHDOG_INTERVAL_MS = 60_000;
+const SESSION_WATCHDOG_FAILURE_LIMIT = 2;
+const SESSION_WATCHDOG_OFFLINE_LIMIT = 3;
+const SESSION_RECOVERY_COOLDOWN_MS = 90_000;
 
 class MammotionPyMammotion extends utils.Adapter {
     private sidecar: SidecarClient | null = null;
     private readonly deviceSnapshots = new Map<string, NormalizedDeviceSnapshot>();
     private readonly deviceChannels = new Map<string, string>();
     private sidecarStopRequested = false;
+    private controlledSidecarExit = false;
     private restartTimer: ioBroker.Timeout | undefined;
+    private watchdogTimer: ioBroker.Interval | undefined;
     private restartAttempt = 0;
     private readonly restartHistory: number[] = [];
     private bootstrappedPython = "";
+    private sessionValidationFailures = 0;
+    private sessionOfflineChecks = 0;
+    private sessionRecoveryInProgress = false;
+    private lastSessionRecoveryAt = 0;
 
     public constructor(options: Partial<utils.AdapterOptions> = {}) {
         super({
@@ -73,6 +83,7 @@ class MammotionPyMammotion extends utils.Adapter {
                 this.clearTimeout(this.restartTimer);
                 this.restartTimer = undefined;
             }
+            this.stopSessionWatchdog();
             if (this.sidecar) {
                 await this.sidecar.shutdown().catch(() => undefined);
                 await this.sidecar.stop().catch(() => undefined);
@@ -164,6 +175,7 @@ class MammotionPyMammotion extends utils.Adapter {
             await this.setStateChangedAsync("info.connection", false, true);
             await this.setStateChangedAsync("info.lastError", message, true);
             this.restartAttempt = 0;
+            this.stopSessionWatchdog();
             return;
         }
 
@@ -177,7 +189,10 @@ class MammotionPyMammotion extends utils.Adapter {
         await this.setStateChangedAsync("info.authenticated", Boolean(loginResult.authenticated), true);
         await this.refreshDeviceList();
         this.restartAttempt = 0;
+        this.sessionValidationFailures = 0;
+        this.sessionOfflineChecks = 0;
         await this.setStateChangedAsync("info.lastError", "", true);
+        this.ensureSessionWatchdog();
     }
 
     private attachSidecarHandlers(sidecar: SidecarClient): void {
@@ -197,6 +212,11 @@ class MammotionPyMammotion extends utils.Adapter {
     private async handleSidecarExit(code: number | null, signal: NodeJS.Signals | null): Promise<void> {
         await this.setStateChangedAsync("info.sidecarReady", false, true);
         await this.setStateChangedAsync("info.connection", false, true);
+        this.stopSessionWatchdog();
+        if (this.controlledSidecarExit) {
+            this.controlledSidecarExit = false;
+            return;
+        }
         if (this.sidecarStopRequested) {
             return;
         }
@@ -238,6 +258,100 @@ class MammotionPyMammotion extends utils.Adapter {
         }
     }
 
+    private ensureSessionWatchdog(): void {
+        if (this.watchdogTimer) {
+            return;
+        }
+        this.watchdogTimer = this.setInterval(() => {
+            void this.runSessionWatchdog();
+        }, SESSION_WATCHDOG_INTERVAL_MS);
+    }
+
+    private stopSessionWatchdog(): void {
+        if (!this.watchdogTimer) {
+            return;
+        }
+        this.clearInterval(this.watchdogTimer);
+        this.watchdogTimer = undefined;
+    }
+
+    private async runSessionWatchdog(): Promise<void> {
+        if (
+            !this.sidecar ||
+            this.sidecarStopRequested ||
+            this.sessionRecoveryInProgress ||
+            !this.config.email ||
+            !this.config.password
+        ) {
+            return;
+        }
+
+        try {
+            const validation = await this.sidecar.validateConnection({ probe: true });
+            if (!validation.authenticated) {
+                throw new Error(validation.message || "Sidecar is not authenticated");
+            }
+
+            this.sessionValidationFailures = 0;
+            if (validation.device_count > 0 && validation.online_devices === 0) {
+                this.sessionOfflineChecks += 1;
+                this.log.debug(
+                    `Session watchdog: no online devices (${this.sessionOfflineChecks}/${SESSION_WATCHDOG_OFFLINE_LIMIT}), probe=${validation.probe}, lastSnapshotAge=${validation.last_snapshot_age_sec}s`,
+                );
+                if (this.sessionOfflineChecks >= SESSION_WATCHDOG_OFFLINE_LIMIT) {
+                    await this.triggerSessionRecovery("all devices remained offline");
+                }
+                return;
+            }
+
+            this.sessionOfflineChecks = 0;
+        } catch (error) {
+            this.sessionValidationFailures += 1;
+            const message = error instanceof Error ? error.message : String(error);
+            await this.setStateChangedAsync("info.lastError", `Session watchdog: ${message}`, true);
+            this.log.warn(
+                `Session watchdog validation failed (${this.sessionValidationFailures}/${SESSION_WATCHDOG_FAILURE_LIMIT}): ${message}`,
+            );
+            if (this.sessionValidationFailures >= SESSION_WATCHDOG_FAILURE_LIMIT) {
+                await this.triggerSessionRecovery(`watchdog validation failed: ${message}`);
+            }
+        }
+    }
+
+    private async triggerSessionRecovery(reason: string): Promise<void> {
+        if (this.sessionRecoveryInProgress || this.sidecarStopRequested) {
+            return;
+        }
+        const now = Date.now();
+        if (now - this.lastSessionRecoveryAt < SESSION_RECOVERY_COOLDOWN_MS) {
+            this.log.debug(`Skipping session recovery during cooldown: ${reason}`);
+            return;
+        }
+
+        this.sessionRecoveryInProgress = true;
+        this.lastSessionRecoveryAt = now;
+        this.stopSessionWatchdog();
+        this.log.warn(`Recovering Mammotion session: ${reason}`);
+        await this.setStateChangedAsync("info.connection", false, true);
+        await this.setStateChangedAsync("info.authenticated", false, true);
+
+        try {
+            if (this.sidecar) {
+                this.controlledSidecarExit = true;
+                await this.sidecar.shutdown().catch(() => undefined);
+                await this.sidecar.stop().catch(() => undefined);
+                this.sidecar = null;
+            }
+            await this.startSidecar();
+        } catch (error) {
+            await this.handleFatalError(error, `Session recovery failed (${reason})`);
+        } finally {
+            this.sessionValidationFailures = 0;
+            this.sessionOfflineChecks = 0;
+            this.sessionRecoveryInProgress = false;
+        }
+    }
+
     private async refreshDeviceList(): Promise<void> {
         if (!this.sidecar) {
             return;
@@ -262,6 +376,7 @@ class MammotionPyMammotion extends utils.Adapter {
                 await this.setStateChangedAsync("info.authenticated", payload.authenticated, true);
                 if (!payload.authenticated && payload.message) {
                     await this.setStateChangedAsync("info.lastError", payload.message, true);
+                    void this.triggerSessionRecovery(`sidecar authentication lost: ${payload.message}`);
                 }
                 break;
             }
@@ -746,9 +861,11 @@ class MammotionPyMammotion extends utils.Adapter {
     private async handleFatalError(error: unknown, prefix: string): Promise<void> {
         const message = error instanceof Error ? error.message : String(error);
         this.log.error(`${prefix}: ${message}`);
+        this.stopSessionWatchdog();
         await this.setStateChangedAsync("info.lastError", `${prefix}: ${message}`, true);
         await this.setStateChangedAsync("info.connection", false, true);
         await this.setStateChangedAsync("info.sidecarReady", false, true);
+        await this.setStateChangedAsync("info.authenticated", false, true);
     }
 }
 

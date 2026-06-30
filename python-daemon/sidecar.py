@@ -7,6 +7,7 @@ import json
 import logging
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 from pymammotion.client import MammotionClient
@@ -15,6 +16,7 @@ from pymammotion.data.model.enums import RTKStatus
 from pymammotion.data.model.generate_route_information import GenerateRouteInformation
 from pymammotion.http.http import MammotionHTTP
 from pymammotion.proto import RptAct, RptInfoType
+from pymammotion.transport.base import AuthError, LoginFailedError, ReLoginRequiredError, SessionExpiredError
 from pymammotion.utility.constant.device_constant import PosType, device_connection, device_mode
 from pymammotion.utility.device_type import DeviceType
 
@@ -36,6 +38,8 @@ class Sidecar:
         self.error_catalog: dict[str, Any] = {}
         self._state_subscriptions: list[Any] = []
         self._ready_emitted = False
+        self._last_snapshot_at = 0.0
+        self._last_snapshot_iso = ""
 
     async def emit(self, method: str, params: dict[str, Any] | None = None) -> None:
         payload = {"method": method}
@@ -62,7 +66,18 @@ class Sidecar:
         params = request.get("params") or {}
         try:
             if method == "health":
-                await self.respond(request_id, {"ok": True, "python_version": sys.version.split()[0]})
+                await self.respond(
+                    request_id,
+                    {
+                        "ok": True,
+                        "python_version": sys.version.split()[0],
+                        "authenticated": self.client is not None,
+                        "last_snapshot_at": self._last_snapshot_iso,
+                    },
+                )
+            elif method == "validate_connection":
+                result = await self.validate_connection(params)
+                await self.respond(request_id, result)
             elif method == "bootstrap":
                 self.log_level = params.get("sidecar_log_level", "info")
                 self.version = str(params.get("adapter_version") or self.version)
@@ -118,6 +133,8 @@ class Sidecar:
         self.cache_path = Path(params["cache_path"])
         await self.teardown_client()
         self.client = MammotionClient(ha_version=self.version)
+        self.client.on_unrecoverable_auth_error = self.on_unrecoverable_auth_error
+        self.client.on_credentials_updated = self.on_credentials_updated
 
         used_cache = False
         cache_data: dict[str, Any] = {}
@@ -150,6 +167,60 @@ class Sidecar:
             await self.emit("device_snapshot", {"snapshot": snapshot})
         return {"authenticated": True, "devices": self.list_device_names()}
 
+    async def validate_connection(self, params: dict[str, Any]) -> dict[str, Any]:
+        if self.client is None:
+            raise JsonRpcError("Client is not initialized")
+
+        device_names = self.list_device_names()
+        online_devices = 0
+        for device_id in device_names:
+            snapshot = self.get_snapshot(device_id)
+            if snapshot and bool(snapshot["status"]["online"]):
+                online_devices += 1
+
+        result = {
+            "ok": True,
+            "authenticated": True,
+            "device_count": len(device_names),
+            "online_devices": online_devices,
+            "probe": "none",
+            "last_snapshot_at": self._last_snapshot_iso,
+            "last_snapshot_age_sec": max(0.0, time.monotonic() - self._last_snapshot_at) if self._last_snapshot_at > 0 else -1.0,
+        }
+
+        if not bool(params.get("probe", True)):
+            return result
+
+        try:
+            if self.client.cloud_gateway is not None:
+                await self.client.cloud_gateway.check_or_refresh_session()
+                await self.client.cloud_gateway.list_binding_by_account()
+                result["probe"] = "aliyun:list_binding_by_account"
+            elif self.client.mammotion_http is not None:
+                await self.client.mammotion_http.get_user_device_list()
+                result["probe"] = "mammotion:get_user_device_list"
+            else:
+                result["probe"] = "none"
+            await self.persist_cache()
+        except Exception as error:
+            message = f"Connection validation failed: {error}"
+            if self.is_auth_error(error):
+                await self.emit("auth_state", {"authenticated": False, "message": message})
+            raise JsonRpcError(message)
+
+        return result
+
+    async def on_unrecoverable_auth_error(self, account_id: str, transport_type: Any, exc: Exception) -> None:
+        transport_name = getattr(transport_type, "value", str(transport_type))
+        message = f"{transport_name} auth failed for {account_id}: {exc}"
+        await self.log("warning", message)
+        await self.emit("auth_state", {"authenticated": False, "message": message})
+        await self.emit("error", {"message": message})
+
+    async def on_credentials_updated(self) -> None:
+        await self.persist_cache()
+        await self.log("debug", "PyMammotion credentials updated; cache persisted")
+
     async def diagnostic_login(self, params: dict[str, Any]) -> dict[str, Any]:
         account = params["account"]
         password = params["password"]
@@ -174,6 +245,7 @@ class Sidecar:
                 normalized = self.get_snapshot(current_device_id)
                 if normalized is None:
                     return
+                self.touch_snapshot_clock()
                 await self.emit("device_snapshot", {"snapshot": normalized})
                 await self.emit("device_online", {"device_id": current_device_id, "online": bool(normalized["status"]["online"])})
 
@@ -242,6 +314,14 @@ class Sidecar:
         serialized_cache = self.make_json_compatible(self.client.to_cache())
         self.cache_path.write_text(json.dumps(serialized_cache), "utf8")
 
+    def touch_snapshot_clock(self) -> None:
+        self._last_snapshot_at = time.monotonic()
+        self._last_snapshot_iso = datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def is_auth_error(error: Exception) -> bool:
+        return isinstance(error, AuthError | ReLoginRequiredError | LoginFailedError | SessionExpiredError)
+
     @staticmethod
     def first_non_empty(*values: Any) -> Any:
         for value in values:
@@ -280,6 +360,7 @@ class Sidecar:
     async def emit_snapshot(self, device_id: str) -> None:
         snapshot = self.get_snapshot(device_id)
         if snapshot is not None:
+            self.touch_snapshot_clock()
             await self.emit("device_snapshot", {"snapshot": snapshot})
 
     def get_area_hashes(self, device: Any, requested_hashes: list[Any] | None = None) -> list[int]:
@@ -456,7 +537,7 @@ class Sidecar:
         battery_level = self.to_int(self.first_non_empty(getattr(dev, "battery_val", None), snapshot.battery_level, 0), 0)
         error_codes = list(getattr(errors, "err_code_list", []) or [])
         error_times = list(getattr(errors, "err_code_list_time", []) or [])
-        selected_zone_hashes = [self.to_int(hash_id, 0) for hash_id in getattr(device.work, "zone_hashs", []) if self.to_int(hash_id, 0) > 0]
+        selected_zone_hashes = [self.to_int(hash_id, 0) for hash_id in getattr(work, "zone_hashs", []) if self.to_int(hash_id, 0) > 0]
         last_error_code = self.to_int(error_codes[0], 0) if error_codes else 0
         last_error_time = error_times[0] if error_times else 0
         last_error_message, last_error_solution = self.get_error_message(last_error_code)

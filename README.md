@@ -148,6 +148,9 @@ If `areas` is omitted, `startSelected` uses `zones.selectedAreas`.
 - In that case, retry the sync later.
 
 ## Changelog
+### **WORK IN PROGRESS**
+* Automatic re-login when the sidecar connection is lost
+
 ### 0.1.0 (2026-06-30)
 * Initial release
 

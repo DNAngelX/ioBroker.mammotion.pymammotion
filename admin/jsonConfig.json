@@ -38,7 +38,7 @@
                     "label": "checkPythonBtn",
                     "command": "checkPython",
                     "jsonData": "{}",
-                    "result": "{}",
+                    "result": {},
                     "newLine": true,
                     "variant": "contained"
                 },

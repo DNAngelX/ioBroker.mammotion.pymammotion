@@ -35,7 +35,6 @@ class MammotionPyMammotion extends utils.Adapter {
         });
         this.on("ready", this.onReady.bind(this));
         this.on("stateChange", this.onStateChange.bind(this));
-        this.on("message", this.onMessage.bind(this));
         this.on("unload", this.onUnload.bind(this));
     }
 
@@ -741,18 +740,6 @@ class MammotionPyMammotion extends utils.Adapter {
             await this.setStateChangedAsync("info.lastError", `Clear cache failed: ${message}`, true);
         } finally {
             await this.setStateChangedAsync(stateId, false, true);
-        }
-    }
-
-    private async onMessage(obj: ioBroker.Message): Promise<void> {
-        if (obj.command === "checkPython") {
-            try {
-                const exe = this.config.pythonExecutable || "python3";
-                const version = await detectPythonVersion(exe);
-                this.sendTo(obj.from, obj.command, { result: version ? `✓ Python ${version} gefunden` : "✗ Python nicht gefunden", version: version ?? null }, obj.callback);
-            } catch (error) {
-                this.sendTo(obj.from, obj.command, { result: `✗ Fehler: ${error instanceof Error ? error.message : String(error)}`, version: null }, obj.callback);
-            }
         }
     }
 

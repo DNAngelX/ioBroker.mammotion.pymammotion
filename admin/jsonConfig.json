@@ -33,15 +33,6 @@
                     "label": "bootstrapOnStart",
                     "newLine": true
                 },
-                "checkPythonBtn": {
-                    "type": "sendTo",
-                    "label": "checkPythonBtn",
-                    "command": "checkPython",
-                    "jsonData": "{}",
-                    "result": {},
-                    "newLine": true,
-                    "variant": "contained"
-                },
                 "installHintHeader": {
                     "type": "staticText",
                     "text": "installHintHeader",
@@ -51,8 +42,7 @@
                 "installHintLinux": {
                     "type": "staticText",
                     "text": "installHintLinux",
-                    "newLine": true,
-                    "style": { "marginBottom": "4px" }
+                    "newLine": true
                 },
                 "installCmdLinux": {
                     "type": "text",
@@ -67,7 +57,7 @@
                     "type": "staticText",
                     "text": "installHintVerify",
                     "newLine": true,
-                    "style": { "marginTop": "8px", "marginBottom": "4px" }
+                    "style": { "marginTop": "8px" }
                 },
                 "installCmdVerify": {
                     "type": "text",

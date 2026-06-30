@@ -49,7 +49,6 @@ class MammotionPyMammotion extends utils.Adapter {
     });
     this.on("ready", this.onReady.bind(this));
     this.on("stateChange", this.onStateChange.bind(this));
-    this.on("message", this.onMessage.bind(this));
     this.on("unload", this.onUnload.bind(this));
   }
   async onReady() {
@@ -685,17 +684,6 @@ class MammotionPyMammotion extends utils.Adapter {
       await this.setStateChangedAsync("info.lastError", `Clear cache failed: ${message}`, true);
     } finally {
       await this.setStateChangedAsync(stateId, false, true);
-    }
-  }
-  async onMessage(obj) {
-    if (obj.command === "checkPython") {
-      try {
-        const exe = this.config.pythonExecutable || "python3";
-        const version = await (0, import_bootstrap.detectPythonVersion)(exe);
-        this.sendTo(obj.from, obj.command, { result: version ? `\u2713 Python ${version} gefunden` : "\u2717 Python nicht gefunden", version: version != null ? version : null }, obj.callback);
-      } catch (error) {
-        this.sendTo(obj.from, obj.command, { result: `\u2717 Fehler: ${error instanceof Error ? error.message : String(error)}`, version: null }, obj.callback);
-      }
     }
   }
   async handleFatalError(error, prefix) {

@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "mammotion-pymammotion",
-    "version": "0.1.2",
+    "version": "0.1.3",
     "news": {
+      "0.1.3": {
+        "en": "Fixed zone name display",
+        "de": "Anzeige des festen Zonennamens",
+        "ru": "Отображение фиксированного названия зоны",
+        "pt": "Exibição do nome da zona fixa",
+        "nl": "Vaste weergave van de zonenaam",
+        "fr": "Affichage du nom de la zone fixe",
+        "it": "Visualizzazione del nome della zona fissa",
+        "es": "Visualización fija del nombre de la zona",
+        "pl": "Stałe wyświetlanie nazwy strefy",
+        "uk": "Виправлено відображення назви зони",
+        "zh-cn": "固定区域名称显示"
+      },
       "0.1.2": {
         "en": "Zone settings, ordering, and scheduling support",
         "de": "Zoneneinstellungen, Bestellung und Planungsunterstützung",

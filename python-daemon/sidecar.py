@@ -42,6 +42,8 @@ class Sidecar:
         self._ready_emitted = False
         self._last_snapshot_at = 0.0
         self._last_snapshot_iso = ""
+        self._area_name_sync_inflight: set[str] = set()
+        self._area_name_sync_signatures: dict[str, str] = {}
 
     async def emit(self, method: str, params: dict[str, Any] | None = None) -> None:
         payload = {"method": method}
@@ -388,6 +390,65 @@ class Sidecar:
             self.touch_snapshot_clock()
             await self.emit("device_snapshot", {"snapshot": snapshot})
 
+    def area_names_need_sync(self, map_data: Any) -> bool:
+        area_map = getattr(map_data, "area", {}) or {}
+        if not area_map:
+            return False
+
+        current_names = list(getattr(map_data, "area_name", []) or [])
+        if not current_names:
+            return True
+
+        sorted_hashes = sorted(self.to_int(hash_id, 0) for hash_id in area_map.keys() if self.to_int(hash_id, 0) > 0)
+        if len(current_names) != len(sorted_hashes):
+            return True
+
+        fallback_names_by_hash = {hash_id: f"area {index}" for index, hash_id in enumerate(sorted_hashes, start=1)}
+        for item in current_names:
+            hash_id = self.to_int(getattr(item, "hash", 0), 0)
+            name = str(getattr(item, "name", "") or "").strip()
+            if hash_id <= 0 or not name:
+                return True
+            if fallback_names_by_hash.get(hash_id) != name:
+                return False
+        return True
+
+    def area_name_sync_signature(self, map_data: Any) -> str:
+        area_map = getattr(map_data, "area", {}) or {}
+        hashes = sorted(self.to_int(hash_id, 0) for hash_id in area_map.keys() if self.to_int(hash_id, 0) > 0)
+        return ",".join(str(hash_id) for hash_id in hashes)
+
+    def schedule_area_name_sync_if_needed(self, device_id: str, product_key: str, map_data: Any) -> None:
+        if self.client is None or map_data is None:
+            return
+        if DeviceType.is_luba1(device_id) or DeviceType.is_rtk(device_id, product_key) or DeviceType.is_swimming_pool(device_id):
+            return
+        if not self.area_names_need_sync(map_data):
+            self._area_name_sync_signatures.pop(device_id, None)
+            return
+
+        signature = self.area_name_sync_signature(map_data)
+        if not signature or device_id in self._area_name_sync_inflight:
+            return
+        if self._area_name_sync_signatures.get(device_id) == signature:
+            return
+
+        self._area_name_sync_signatures[device_id] = signature
+        self._area_name_sync_inflight.add(device_id)
+        asyncio.create_task(self._run_area_name_sync(device_id))
+
+    async def _run_area_name_sync(self, device_id: str) -> None:
+        try:
+            if self.client is None:
+                return
+            await self.log("debug", f"Triggering explicit area-name sync for {device_id}")
+            await self.client.start_area_name_sync(device_id)
+            await self.persist_cache()
+        except Exception as error:  # noqa: BLE001
+            await self.log("debug", f"Explicit area-name sync failed for {device_id}: {error}")
+        finally:
+            self._area_name_sync_inflight.discard(device_id)
+
     def get_area_hashes(self, device: Any, requested_hashes: list[Any] | None = None) -> list[int]:
         map_data = getattr(device, "map", None)
         work = getattr(device, "work", None)
@@ -568,6 +629,7 @@ class Sidecar:
         map_data = getattr(device, "map", None)
         product_key = self.get_product_key(device)
         device_type = self.get_device_type(device_id, product_key)
+        self.schedule_area_name_sync_if_needed(device_id, product_key, map_data)
 
         firmware = getattr(mower_state, "swversion", "") or getattr(device_firmwares, "device_version", "") or getattr(
             device,

@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "mammotion-pymammotion",
-    "version": "0.1.3",
+    "version": "0.1.4",
     "news": {
+      "0.1.4": {
+        "en": "Further zone name corrections",
+        "de": "Weitere Korrekturen der Zonennamen",
+        "ru": "Дальнейшие исправления названий зон.",
+        "pt": "Correções adicionais nos nomes das zonas",
+        "nl": "Verdere correcties van zonenamen",
+        "fr": "Corrections supplémentaires des noms de zones",
+        "it": "Ulteriori correzioni ai nomi delle zone",
+        "es": "Correcciones adicionales en los nombres de las zonas",
+        "pl": "Dalsze poprawki nazw stref",
+        "uk": "Подальші виправлення назв зон",
+        "zh-cn": "进一步的区域名称更正"
+      },
       "0.1.3": {
         "en": "Fixed zone name display",
         "de": "Anzeige des festen Zonennamens",
